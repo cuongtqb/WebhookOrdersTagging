@@ -12,7 +12,6 @@ const Setting = () => {
 
     const fetchData = useCallback(async () => {
         const getSetting = await axios.get('/setting');
-        console.log('getSetting', getSetting);
         if (getSetting?.data && getSetting?.status === 200) {
             setData({ ...data, ...getSetting.data });
         }
