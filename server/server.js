@@ -8,16 +8,6 @@ import serveStatic from "koa-static";
 import fs from "fs";
 import path from "path";
 import verifyRequest from "./middlewares/verifyRequest";
-import mongoose from 'mongoose';
-import bodyParser from 'koa-bodyparser';
-import {
-  storeCallback,
-  loadCallback,
-  deleteCallback
-} from './customSessionStorage'
-import Setting from './models/setting.js';
-import Session from './models/session.js';
-
 
 dotenv.config();
 
@@ -32,7 +22,7 @@ Shopify.Context.initialize({
   HOST_NAME: process.env.HOST.replace(/https:\/\//, ""),
   API_VERSION: ApiVersion.Unstable,
   IS_EMBEDDED_APP: true,
-  SESSION_STORAGE: new Shopify.Session.CustomSessionStorage(storeCallback, loadCallback, deleteCallback),
+  SESSION_STORAGE: new Shopify.Session.MemorySessionStorage(),
 });
 
 const ACTIVE_SHOPIFY_SHOPS = {};
@@ -40,58 +30,9 @@ Shopify.Webhooks.Registry.addHandler("APP_UNINSTALLED", {
   path: "/webhooks",
   webhookHandler: async (topic, shop, body) => {
     delete ACTIVE_SHOPIFY_SHOPS[shop];
-    console.log("webhookHandler", body);
   }
 });
 
-Shopify.Webhooks.Registry.addHandler("PRODUCTS_CREATE", {
-  path: "/products",
-  webhookHandler: async (topic, shop, body) => {
-    delete ACTIVE_SHOPIFY_SHOPS[shop];
-  }
-});
-
-Shopify.Webhooks.Registry.addHandler("ORDERS_CREATE", {
-  path: "/orders",
-  webhookHandler: async (topic, shop, body) => {
-    const getSession = await Session.findOne({ shop });
-    delete ACTIVE_SHOPIFY_SHOPS[shop];
-    const newBody = JSON.parse(body);
-    const totalPrice = parseInt(newBody.total_price);
-    const settingTag = await Setting.findOne();
-    if (settingTag?.totalPrice) {
-      if (totalPrice >= settingTag.totalPrice) {
-        if (getSession?.shop && getSession?.accessToken) {
-          const client = new Shopify.Clients.Graphql(getSession.shop, getSession.accessToken);
-          const updateOrder = await client.query({
-            data: {
-              query: `mutation 
-              orderUpdate($input: OrderInput!) {
-                orderUpdate(input: $input) {
-                  userErrors {
-                    field
-                    message
-                  }
-                  order {
-                    id
-                    tags
-                  }
-                }
-              }
-              `,
-              variables: {
-                input: {
-                  "id": `gid://shopify/Order/${newBody.id}`,
-                  "tags": [`${settingTag.tag}`]
-                }
-              }
-            }
-          });
-        }
-      }
-    }
-  }
-});
 
 function renderView(file, vars) {
   let content = fs.readFileSync(path.join(__dirname, "views", `${file}.html`), {
@@ -108,31 +49,11 @@ function renderView(file, vars) {
 
 const TOP_LEVEL_OAUTH_COOKIE = "shopify_top_level_oauth";
 const USE_ONLINE_TOKENS = true;
-const listPath = ['/webhooks', '/orders', '/products'];
 
 async function createAppServer() {
   const server = new Koa();
   const router = new Router();
   server.keys = [Shopify.Context.API_SECRET_KEY];
-  server.use(async (ctx, next) => {
-    if (listPath.includes(ctx.path)) ctx.disableBodyParser = true;
-    await next();
-  });
-  server.use(bodyParser());
-
-
-  const urlMongo = process.env.MONGODB_URL;
-  const connectionParams = {
-    useNewUrlParser: true,
-    useUnifiedTopology: true
-  }
-  mongoose.connect(urlMongo, connectionParams);
-  const db = mongoose.connection;
-  db.on("error", console.error.bind(console, "connection error: "));
-  db.once("open", function () {
-    console.log("Connected successfully");
-  });
-
 
   let middleware;
   if (dev) {
@@ -185,40 +106,16 @@ async function createAppServer() {
       const host = ctx.query.host;
       ACTIVE_SHOPIFY_SHOPS[session.shop] = session.scope;
 
-      const [response, ordersCreateWebhook, productCreateWebhook] = await Promise.all([
-        Shopify.Webhooks.Registry.register({
-          shop: session.shop,
-          accessToken: session.accessToken,
-          topic: "APP_UNINSTALLED",
-          path: "/webhooks",
-        }),
-        Shopify.Webhooks.Registry.register({
-          path: '/orders',
-          topic: 'ORDERS_CREATE',
-          shop: session.shop,
-          accessToken: session.accessToken
-        }),
-        Shopify.Webhooks.Registry.register({
-          path: '/products',
-          topic: 'PRODUCTS_CREATE',
-          shop: session.shop,
-          accessToken: session.accessToken
-        })
-      ])
+      const response = await  Shopify.Webhooks.Registry.register({
+        shop: session.shop,
+        accessToken: session.accessToken,
+        topic: "APP_UNINSTALLED",
+        path: "/webhooks",
+      });
 
       if (!response["APP_UNINSTALLED"].success) {
         console.log(
           `Failed to register APP_UNINSTALLED webhook: ${response.result}`
-        );
-      }
-      if (!ordersCreateWebhook["ORDERS_CREATE"]?.success) {
-        console.log(
-          `Failed to register ORDERS_CREATE webhook: ${ordersCreateWebhook.result}`
-        );
-      }
-      if (!productCreateWebhook["PRODUCTS_CREATE"]?.success) {
-        console.log(
-          `Failed to register PRODUCTS_CREATE webhook: ${productCreateWebhook.result}`
         );
       }
 
@@ -248,57 +145,6 @@ async function createAppServer() {
       console.log(`Failed to process webhook: ${error}`);
     }
   });
-
-  router.post("/products", async (ctx) => {
-    try {
-      await Shopify.Webhooks.Registry.process(ctx.req, ctx.res);
-      console.log(`Webhook processed products, returned status code 200`);
-    } catch (error) {
-      console.log(`Failed to process webhook: ${error}`);
-    }
-  });
-
-  router.post("/orders", async (ctx) => {
-    try {
-      await Shopify.Webhooks.Registry.process(ctx.req, ctx.res);
-      console.log("/webhooks orders", ctx)
-      console.log(`Webhook processed orders, returned status code 200`);
-    } catch (error) {
-      console.log(`Failed to process webhook: ${error}`);
-    }
-  });
-
-  router.put('/setting', async (ctx) => {
-    try {
-      const { _id, totalPrice, tag } = ctx.request.body;
-      let setting;
-      if (!_id) {
-        setting = await Setting.create({ totalPrice, tag });
-      }
-      else {
-        setting = await Setting.updateOne({ _id }, { $set: { totalPrice, tag } }, { upsert: true });
-      }
-      ctx.status = 200;
-      ctx.response.body = setting;
-    } catch (error) {
-      console.log("Create Setting error", error);
-    }
-  })
-
-  router.get('/setting', async (ctx) => {
-    try {
-      ctx.status = 200;
-      const setting = await Setting.findOne();
-      if (setting) {
-        return ctx.response.body = setting;
-      }
-      return ctx.response.body = null;
-    } catch (error) {
-      console.log("Get Setting error", error);
-    }
-  })
-
-
 
   router.post(
     "/graphql",

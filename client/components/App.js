@@ -16,7 +16,6 @@ import "@shopify/polaris/dist/styles.css";
 import translations from "@shopify/polaris/locales/en.json";
 import ProductsPage from "./ProductsPage";
 import PageLayout from "./PageLayout";
-import OrderTagging from "./OrderTagging";
 
 function userLoggedInFetch(app) {
   const fetchFunction = authenticatedFetch(app);
@@ -65,7 +64,9 @@ const App = () => {
         }}
       >
         <MyProvider>
-            <OrderTagging/>
+          <PageLayout>
+            <ProductsPage />
+          </PageLayout>
         </MyProvider>
       </AppBridgeProvider>
     </PolarisProvider>
